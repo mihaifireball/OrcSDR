@@ -105,7 +105,7 @@ struct rtl_sdr_v4_esp_handle {
     /* Blog V3 / R820T2 software shadow, registers 0x05..0x1f. */
     uint8_t v3_r820_regs[0x20 - 0x05]{};
     bool v3_r820_shadow_valid = false;
-	int v3_gain_db10 = 0;
+	int v3_gain_db10 = -1;
 
     TaskHandle_t host_task = nullptr;
     TaskHandle_t client_task = nullptr;
@@ -137,6 +137,7 @@ struct rtl_sdr_v4_esp_handle {
 
     /** LO request; applied by retune path after bulk drain (never EP0 mid-bulk). */
     volatile uint32_t pending_retune_hz = 0;
+	volatile int pending_gain_db10 = -1;
 
     /* Blog V3 IQ conditioning state. */
     /*
@@ -2015,7 +2016,9 @@ static void host_lib_task_fn(void *arg)
 
     vTaskDelete(nullptr);
 }
-
+static esp_err_t v3_apply_gain_db10(
+    rtl_sdr_v4_esp_handle_t handle,
+    int gain_db10);
 static void v3_probe_task_fn(void *arg)
 {
     auto *h = static_cast<rtl_sdr_v4_esp_handle *>(arg);
@@ -2038,7 +2041,22 @@ static void v3_probe_task_fn(void *arg)
                          rtl_sdr_v4_esp_err_to_name(retune_err));
             }
         }
+		if (h->pending_gain_db10 >= 0 &&
+			h->streaming &&
+			!h->v3_probe_pending) {
 
+			const int requested_gain = h->pending_gain_db10;
+			h->pending_gain_db10 = -1;
+
+			const esp_err_t gain_err =
+				v3_apply_gain_db10(h, requested_gain);
+
+			if (gain_err != ESP_OK) {
+				ESP_LOGW(TAG,
+						 "gain worker failed: %s",
+						 rtl_sdr_v4_esp_err_to_name(gain_err));
+			}
+		}
         if (!h->v3_probe_pending) {
             continue;
         }
@@ -2618,12 +2636,23 @@ esp_err_t rtl_sdr_v4_esp_start(rtl_sdr_v4_esp_handle_t handle,
         }
 
         if (ret == ESP_OK) {
-            ret = v3_r820_set_auto_gain(handle);
-            if (ret != ESP_OK) {
-                ESP_LOGW(TAG, "Blog V3 GAIN setup failed: %s",
-                         rtl_sdr_v4_esp_err_to_name(ret));
-            }
-        }
+			ret = v3_r820_set_auto_gain(handle);
+
+			if (ret != ESP_OK) {
+				ESP_LOGW(TAG, "Blog V3 GAIN setup failed: %s",
+						 rtl_sdr_v4_esp_err_to_name(ret));
+			} else if (handle->v3_gain_db10 >= 0) {
+				ret = rtl_sdr_v4_esp_set_gain_db10(
+					handle,
+					handle->v3_gain_db10);
+
+				if (ret != ESP_OK) {
+					ESP_LOGW(TAG,
+							 "Blog V3 saved gain apply failed: %s",
+							 rtl_sdr_v4_esp_err_to_name(ret));
+				}
+			}
+		}
 
         if (ret == ESP_OK) {
 
@@ -2725,6 +2754,7 @@ esp_err_t rtl_sdr_v4_esp_start(rtl_sdr_v4_esp_handle_t handle,
                 handle->metrics.consumer_drops = 0;
                 handle->stream_start_ms = now_ms();
                 handle->pending_retune_hz = 0;
+				handle->pending_gain_db10 = -1;
                 handle->pause_resubmit = false;
                 handle->live_urbs = 0;
                 handle->streaming = true;
@@ -2974,6 +3004,66 @@ esp_err_t rtl_sdr_v4_esp_get_supported_gains(
     return ESP_OK;
 }
 
+static esp_err_t v3_apply_gain_db10(
+    rtl_sdr_v4_esp_handle_t handle,
+    int gain_db10)
+{
+    if (!handle->v3_r820_shadow_valid) {
+        return RTL_SDR_V4_ESP_ERR_NOT_READY;
+    }
+
+    size_t best = 0;
+    int best_delta = std::abs(gain_db10 - kV3SupportedGainsDb10[0]);
+
+    for (size_t i = 1; i < std::size(kV3SupportedGainsDb10); ++i) {
+        const int delta =
+            std::abs(gain_db10 - kV3SupportedGainsDb10[i]);
+
+        if (delta < best_delta) {
+            best_delta = delta;
+            best = i;
+        }
+    }
+
+    const int selected = kV3SupportedGainsDb10[best];
+
+    uint8_t lna_index = 0;
+    uint8_t mixer_index = 0;
+
+    v3_gain_indices_for_db10(
+        selected,
+        &lna_index,
+        &mixer_index);
+
+    esp_err_t err =
+        v3_r820_write_reg_mask(handle, 0x05, 0x10, 0x10);
+    if (err != ESP_OK) return err;
+
+    err = v3_r820_write_reg_mask(handle, 0x05, lna_index, 0x0f);
+    if (err != ESP_OK) return err;
+
+    err = v3_r820_write_reg_mask(handle, 0x07, 0x00, 0x10);
+    if (err != ESP_OK) return err;
+
+    err = v3_r820_write_reg_mask(handle, 0x07, mixer_index, 0x0f);
+    if (err != ESP_OK) return err;
+
+    err = v3_r820_write_reg_mask(handle, 0x0c, 0x08, 0x9f);
+    if (err != ESP_OK) return err;
+
+    handle->v3_gain_db10 = selected;
+
+    ESP_LOGI(
+        TAG,
+        "Blog V3 gain requested=%d applied=%d lna=%u mixer=%u vga=8",
+        gain_db10,
+        selected,
+        static_cast<unsigned>(lna_index),
+        static_cast<unsigned>(mixer_index));
+
+    return ESP_OK;
+}
+
 esp_err_t rtl_sdr_v4_esp_set_gain_db10(
     rtl_sdr_v4_esp_handle_t handle,
     int gain_db10)
@@ -2990,78 +3080,33 @@ esp_err_t rtl_sdr_v4_esp_set_gain_db10(
         return RTL_SDR_V4_ESP_ERR_NOT_READY;
     }
 
-    size_t best = 0;
-    int best_delta = std::abs(gain_db10 - kV3SupportedGainsDb10[0]);
-
-    for (size_t i = 1; i < std::size(kV3SupportedGainsDb10); ++i) {
-        const int delta = std::abs(gain_db10 - kV3SupportedGainsDb10[i]);
-
-        if (delta < best_delta) {
-            best_delta = delta;
-            best = i;
-        }
+    /*
+     * During startup there are no live bulk URBs yet, so applying the
+     * saved gain synchronously is safe.
+     */
+    if (!handle->streaming) {
+        return v3_apply_gain_db10(handle, gain_db10);
     }
 
     /*
-     * Temporary first implementation:
-     * map the requested discrete gain to an LNA index while
-     * preserving the current mixer/VGA profile.
+     * While streaming, never perform EP0 tuner writes here.
+     * Queue the newest request to the blocking-control worker.
      */
+    {
+        HandleLock lk(handle, kQueryLockTicks);
+        if (!lk.ok()) {
+            return RTL_SDR_V4_ESP_ERR_TIMEOUT;
+        }
 
-    const int selected = kV3SupportedGainsDb10[best];
+        handle->pending_gain_db10 = gain_db10;
+        set_error_unlocked(handle, ESP_OK);
+    }
 
-	uint8_t lna_index = 0;
-	uint8_t mixer_index = 0;
+    if (handle->v3_probe_task == nullptr) {
+        return RTL_SDR_V4_ESP_ERR_NOT_READY;
+    }
 
-	v3_gain_indices_for_db10(
-		selected,
-		&lna_index,
-		&mixer_index);
-
-	/* LNA manual mode + gain index. */
-	esp_err_t err =
-		v3_r820_write_reg_mask(handle, 0x05, 0x10, 0x10);
-
-	if (err != ESP_OK) {
-		return err;
-	}
-
-	err = v3_r820_write_reg_mask(handle, 0x05, lna_index, 0x0f);
-
-	if (err != ESP_OK) {
-		return err;
-	}
-
-	/* Mixer manual mode + gain index. */
-	err = v3_r820_write_reg_mask(handle, 0x07, 0x00, 0x10);
-
-	if (err != ESP_OK) {
-		return err;
-	}
-
-	err = v3_r820_write_reg_mask(handle, 0x07, mixer_index, 0x0f);
-
-	if (err != ESP_OK) {
-		return err;
-	}
-
-	/* Standard manual R82xx VGA setting. */
-	err = v3_r820_write_reg_mask(handle, 0x0c, 0x08, 0x9f);
-
-	if (err != ESP_OK) {
-		return err;
-	}
-
-	handle->v3_gain_db10 = selected;
-
-    ESP_LOGI(
-		TAG,
-		"Blog V3 gain requested=%d applied=%d lna=%u mixer=%u vga=8",
-		gain_db10,
-		handle->v3_gain_db10,
-		static_cast<unsigned>(lna_index),
-		static_cast<unsigned>(mixer_index));
-
+    xTaskNotifyGive(handle->v3_probe_task);
     return ESP_OK;
 }
 

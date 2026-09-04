@@ -11,6 +11,7 @@ namespace {
 constexpr uint16_t kGrid = 0x2104;
 constexpr int kBandWidths[] = {110, 110, 110, 120, 140, 160, 170, 200};
 constexpr int kTuneWidths[] = {170, 170, 220, 150, 150, 220};
+constexpr int kV3TuneWidths[] = {130, 130, 150, 130, 130, 130, 130, 86};
 }
 
 uint16_t waterfall_color(float level) {
@@ -150,6 +151,32 @@ ControlAction control_action(const ControlLayout& layout, bool lora, int touch_x
     case 5: return ControlAction::browse;
     case 6: return ControlAction::toggle_audio_record;
     case 7: return ControlAction::toggle_capture;
+    default: return ControlAction::none;
+  }
+}
+
+ControlAction v3_tune_action(const ControlLayout& layout,
+                             int touch_x,
+                             int touch_y) {
+  const int index =
+      button_at(layout.edge,
+                layout.tune_y,
+                layout.height,
+                layout.gap,
+                touch_x,
+                touch_y,
+                kV3TuneWidths,
+                std::size(kV3TuneWidths));
+
+  switch (index) {
+    case 0: return ControlAction::frequency_down;
+    case 1: return ControlAction::frequency_up;
+    case 2: return ControlAction::toggle_sound;
+    case 3: return ControlAction::gain_down;
+    case 4: return ControlAction::gain_up;
+    case 5: return ControlAction::volume_down;
+    case 6: return ControlAction::volume_up;
+    case 7: return ControlAction::toggle_graphics;
     default: return ControlAction::none;
   }
 }

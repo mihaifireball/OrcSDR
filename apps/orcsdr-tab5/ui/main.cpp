@@ -1401,6 +1401,7 @@ char rtl_sdr_serial[48]{};
 char rtl_sdr_speed[8] = "none";
 uint16_t rtl_sdr_vid = 0;
 uint16_t rtl_sdr_pid = 0;
+std::atomic<bool> rtl_is_blog_v3{false};
 uint8_t pending_usb_address = 0;
 #if RTL_USE_LEGACY_USB
 usb_host_client_handle_t usb_client = nullptr;
@@ -1426,6 +1427,13 @@ std::atomic<uint32_t> rtl_requested_frequency_hz{kRtlFmDefaultHz};
 std::atomic<uint32_t> rtl_hot_retune_hz{0};
 std::atomic<uint8_t> rtl_requested_volume{kRtlVolumeDefault};
 std::atomic<uint8_t> rtl_live_volume{kRtlVolumeDefault};
+std::atomic<int> rtl_v3_gain_db10{0};
+static constexpr int kRtlV3GainStepsDb10[] = {
+    0, 9, 14, 27, 37, 77, 87, 125, 144, 157,
+    166, 197, 207, 229, 254, 280, 297, 328,
+    338, 364, 372, 386, 402, 421, 434, 439,
+    445, 480, 496
+};
 std::atomic<bool> rtl_audio_user_enabled{true};
 std::atomic<bool> rtl_audio_enabled{false};
 std::atomic<bool> rtl_speaker_start_allowed{false};
@@ -4628,6 +4636,9 @@ const char* rtl_capture_state_name(RtlCaptureState state) {
 
 void draw_sdr_controls(RtlBand band, bool running) {
   if (!orcsdr::screens::is_active(orcsdr::screens::Id::radio)) return;
+  Serial.printf("RTL_UI_DRAW v3=%s running=%s\n",
+              rtl_is_blog_v3.load(std::memory_order_acquire) ? "true" : "false",
+              running ? "true" : "false");
   const int first_row_y = band == RtlBand::lora ? kSdrTuneY : kSdrBandY;
   M5.Display.fillRect(0, first_row_y - 6, 1280, 720 - (first_row_y - 6), TFT_BLACK);
   if (band == RtlBand::lora) {
@@ -4674,6 +4685,16 @@ void draw_sdr_controls(RtlBand band, bool running) {
   };
   const bool gfx_on = rtl_graphics_enabled.load(std::memory_order_acquire);
   const bool sound_on = rtl_audio_enabled.load(std::memory_order_acquire);
+  char gain_label[24];
+  int gain_db10 = 0;
+
+  if (rtl_is_blog_v3) {
+    gain_db10 = rtl_v3_gain_db10.load(std::memory_order_relaxed);
+    snprintf(gain_label, sizeof(gain_label),
+             "%.1f dB", gain_db10 / 10.0f);
+  } else {
+    snprintf(gain_label, sizeof(gain_label), "GAIN");
+  }
   const orcsdr::radio_ui::Button tune_row[] = {
       {170, "FREQ -", TFT_DARKGREY},
       {170, "FREQ +", TFT_DARKGREY},
@@ -4684,10 +4705,29 @@ void draw_sdr_controls(RtlBand band, bool running) {
       {220, gfx_on ? "GFX ON" : "GFX OFF",
        static_cast<uint32_t>(gfx_on ? TFT_DARKGREEN : TFT_MAROON)},
   };
+  const orcsdr::radio_ui::Button v3_tune_row[] = {
+      {130, "FREQ -", TFT_DARKGREY},
+      {130, "FREQ +", TFT_DARKGREY},
+      {150, sound_on ? "SOUND ON" : "SOUND OFF",
+       static_cast<uint32_t>(sound_on ? TFT_DARKGREEN : TFT_MAROON)},
+      {130, "GAIN -", TFT_DARKCYAN},
+      {130, gain_label, TFT_DARKCYAN},
+      {130, "VOL -", TFT_NAVY},
+      {130, "VOL +", TFT_NAVY},
+      {86, gfx_on ? "GFX ON" : "GFX OFF",
+       static_cast<uint32_t>(gfx_on ? TFT_DARKGREEN : TFT_MAROON)},
+  };
   orcsdr::radio_ui::draw_button_row(kSdrEdge, kSdrBandY, kSdrControlsHeight,
                                     kSdrGap, band_row, std::size(band_row));
-  orcsdr::radio_ui::draw_button_row(kSdrEdge, kSdrTuneY, kSdrControlsHeight,
-                                    kSdrGap, tune_row, std::size(tune_row));
+  if (rtl_is_blog_v3) {
+    orcsdr::radio_ui::draw_button_row(
+        kSdrEdge, kSdrTuneY, kSdrControlsHeight,
+        kSdrGap, v3_tune_row, std::size(v3_tune_row));
+  } else {
+    orcsdr::radio_ui::draw_button_row(
+        kSdrEdge, kSdrTuneY, kSdrControlsHeight,
+        kSdrGap, tune_row, std::size(tune_row));
+  }
 }
 
 /** Freeze scope/waterfall with a clear banner (audio keeps running). */
@@ -6268,10 +6308,20 @@ void inspect_usb_device(uint8_t address) {
   Serial.printf("RTL_SDR_USB vid=%04x pid=%04x speed=%s manufacturer=\"%s\" product=\"%s\" serial=\"%s\"\n",
                 descriptor->idVendor, descriptor->idProduct, speed, manufacturer,
                 product, serial);
+  const bool is_blog_v3 =
+	strcmp(manufacturer, "RTLSDRBlog") == 0 &&
+	strcmp(product, "Blog V3") == 0;
 
-  if (descriptor->idVendor == 0x0bda && descriptor->idProduct == 0x2838 &&
-      strcmp(manufacturer, "RTLSDRBlog") == 0 && strcmp(product, "Blog V4") == 0 &&
-      strcmp(serial, "00000001") == 0) {
+  const bool is_blog_v4 =
+	strcmp(manufacturer, "RTLSDRBlog") == 0 &&
+	strcmp(product, "Blog V4") == 0 &&
+	strcmp(serial, "00000001") == 0;
+
+  if (descriptor->idVendor == 0x0bda &&
+	descriptor->idProduct == 0x2838 &&
+	(is_blog_v3 || is_blog_v4)) {
+
+    rtl_is_blog_v3 = is_blog_v3;
     rtl_sdr_device = device;
     rtl_sdr_vid = descriptor->idVendor;
     rtl_sdr_pid = descriptor->idProduct;
@@ -6279,11 +6329,21 @@ void inspect_usb_device(uint8_t address) {
     strlcpy(rtl_sdr_serial, serial, sizeof(rtl_sdr_serial));
     rtl_capture_state.store(RtlCaptureState::ready, std::memory_order_release);
     char status[96];
-    snprintf(status, sizeof(status), "RTL-SDR V4 ready: %s USB, serial %s", speed, serial);
+	snprintf(status, sizeof(status),
+         "RTL-SDR %s ready: %s USB, serial %s",
+         rtl_is_blog_v3 ? "V3" : "V4",
+         speed,
+         serial);
     set_rtl_sdr_status(status);
-    Serial.printf("RTL_SDR_PROBE_OK v4=true bands=fm,am,wx default_fm_hz=%u "
-                  "sample_rate_sps=%u validation_bytes=%u volume_default=%u continuous_touch=true\n",
-                  kRtlFmDefaultHz, kRtlSampleRateSps, kRtlCaptureBytes, kRtlVolumeDefault);
+    Serial.printf(
+		"RTL_SDR_PROBE_OK v3=%s v4=%s bands=fm,am,wx default_fm_hz=%u "
+		"sample_rate_sps=%u validation_bytes=%u volume_default=%u continuous_touch=true\n",
+		rtl_is_blog_v3 ? "true" : "false",
+		rtl_is_blog_v3 ? "false" : "true",
+		kRtlFmDefaultHz,
+		kRtlSampleRateSps,
+		kRtlCaptureBytes,
+		kRtlVolumeDefault);
   } else {
     if (descriptor->idVendor == 0x0bda && descriptor->idProduct == 0x2838) {
       Serial.println("RTL_SDR_REJECTED reason=official_v4_identity_mismatch");
@@ -6382,18 +6442,43 @@ static void on_rtl_driver_event(rtl_sdr_v4_esp_event_t event, const void *payloa
       rtl_capture_state.store(RtlCaptureState::ready, std::memory_order_release);
       const auto *info = static_cast<const rtl_sdr_v4_esp_device_info_t *>(payload);
       if (info != nullptr) {
-        rtl_sdr_vid = info->vid;
-        rtl_sdr_pid = info->pid;
-        strlcpy(rtl_sdr_serial, info->serial, sizeof(rtl_sdr_serial));
-        strlcpy(rtl_sdr_speed, info->high_speed ? "high" : "full", sizeof(rtl_sdr_speed));
+		rtl_sdr_vid = info->vid;
+		rtl_sdr_pid = info->pid;
+		strlcpy(rtl_sdr_serial, info->serial, sizeof(rtl_sdr_serial));
+		strlcpy(rtl_sdr_speed,
+				info->high_speed ? "high" : "full",
+				sizeof(rtl_sdr_speed));
+
+		rtl_is_blog_v3 =
+			strcmp(info->product, "Blog V3") == 0;
+	  }
+
+	  set_rtl_sdr_status(
+	      rtl_is_blog_v3
+		      ? "RTL-SDR V3 ready (driver)"
+		      : "RTL-SDR V4 ready (driver)");
+
+	  Serial.printf(
+    	"RTL_SDR_PROBE_OK v3=%s v4=%s product=%s driver=rtl_sdr_v4_esp v%s\n",
+		rtl_is_blog_v3 ? "true" : "false",
+		rtl_is_blog_v3 ? "false" : "true",
+		info != nullptr ? info->product : "unknown",
+		rtl_sdr_v4_esp_get_version_string());
+		
+	  bump_rtl_ui();
+
+      if (orcsdr::screens::is_active(orcsdr::screens::Id::radio)) {
+        const bool running =
+            rtl_capture_state.load(std::memory_order_acquire) ==
+            RtlCaptureState::running;
+
+        draw_sdr_controls(rtl_ui_band, running);
       }
-      set_rtl_sdr_status("RTL-SDR V4 ready (driver)");
-      Serial.printf("RTL_SDR_PROBE_OK v4=true driver=rtl_sdr_v4_esp v%s\n",
-                    rtl_sdr_v4_esp_get_version_string());
       break;
     }
     case RTL_SDR_V4_ESP_EVT_DISCONNECTED:
       g_rtl_device_ready.store(false, std::memory_order_release);
+	  rtl_is_blog_v3 = false;
       rtl_capture_state.store(RtlCaptureState::disconnected, std::memory_order_release);
       set_rtl_sdr_status("RTL-SDR: disconnected");
       Serial.println("RTL_SDR_DISCONNECTED");
@@ -9329,7 +9414,14 @@ void handle_sdr_touch(int32_t x, int32_t y) {
                           RtlCaptureState::running);
     return;
   }
-  const auto action = orcsdr::radio_ui::control_action(control_layout, false, x, y);
+  auto action =
+      orcsdr::radio_ui::control_action(control_layout, false, x, y);
+
+  if (rtl_is_blog_v3 &&
+      y >= kSdrTuneY &&
+      y < kSdrTuneY + kSdrControlsHeight) {
+    action = orcsdr::radio_ui::v3_tune_action(control_layout, x, y);
+  }
   if (action == orcsdr::radio_ui::ControlAction::fm) {
       queue_local_rtl_listen(RtlBand::fm, rtl_ui_band == RtlBand::fm
                                                ? rtl_ui_frequency_hz
@@ -9400,6 +9492,59 @@ void handle_sdr_touch(int32_t x, int32_t y) {
     const bool running =
         rtl_capture_state.load(std::memory_order_acquire) == RtlCaptureState::running;
     draw_sdr_controls(rtl_ui_band, running);
+  } else if (action == orcsdr::radio_ui::ControlAction::gain_down ||
+             action == orcsdr::radio_ui::ControlAction::gain_up) {
+
+    if (!rtl_is_blog_v3 || g_rtl == nullptr) {
+      Serial.println("RTL_V3_GAIN_UI ignored: V3 not ready");
+      return;
+    }
+
+    int current = rtl_v3_gain_db10.load(std::memory_order_relaxed);
+
+    size_t best = 0;
+    int best_delta = abs(current - kRtlV3GainStepsDb10[0]);
+
+    for (size_t i = 1; i < std::size(kRtlV3GainStepsDb10); ++i) {
+      const int delta = abs(current - kRtlV3GainStepsDb10[i]);
+
+      if (delta < best_delta) {
+        best = i;
+        best_delta = delta;
+      }
+    }
+
+    if (action == orcsdr::radio_ui::ControlAction::gain_down) {
+      if (best > 0) --best;
+    } else {
+      if (best + 1 < std::size(kRtlV3GainStepsDb10)) ++best;
+    }
+
+    const int requested = kRtlV3GainStepsDb10[best];
+
+    const esp_err_t gain_err =
+        rtl_sdr_v4_esp_set_gain_db10(g_rtl, requested);
+
+    if (gain_err == ESP_OK) {
+      rtl_v3_gain_db10.store(requested, std::memory_order_relaxed);
+
+      Serial.printf(
+          "RTL_V3_GAIN_UI requested=%.1f dB queued\n",
+          static_cast<double>(requested) / 10.0);
+
+      bump_rtl_ui();
+
+      const bool running =
+          rtl_capture_state.load(std::memory_order_acquire) ==
+          RtlCaptureState::running;
+
+      draw_sdr_controls(rtl_ui_band, running);
+    } else {
+      Serial.printf(
+          "RTL_V3_GAIN_UI_FAIL requested=%.1f dB error=%s\n",
+          static_cast<double>(requested) / 10.0,
+          rtl_sdr_v4_esp_err_to_name(gain_err));
+    }
   } else if (action == orcsdr::radio_ui::ControlAction::volume_down) {
     adjust_rtl_volume(-static_cast<int>(kRtlVolumeStep));
   } else if (action == orcsdr::radio_ui::ControlAction::volume_up) {

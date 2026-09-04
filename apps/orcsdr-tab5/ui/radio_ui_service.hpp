@@ -50,6 +50,8 @@ enum class ControlAction : uint8_t {
   toggle_sound,
   volume_down,
   volume_up,
+  gain_down,
+  gain_up,
   toggle_graphics,
   cycle_lora_bandwidth,
   cycle_lora_spreading_factor,
@@ -63,6 +65,9 @@ void draw_button_row(int x, int y, int height, int gap, const Button* buttons, s
 int button_at(int x, int y, int height, int gap, int touch_x, int touch_y,
               const int* widths, size_t count);
 ControlAction control_action(const ControlLayout& layout, bool lora, int touch_x,
+                             int touch_y);
+ControlAction v3_tune_action(const ControlLayout& layout,
+                             int touch_x,
                              int touch_y);
 bool self_check();
 
