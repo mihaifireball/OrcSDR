@@ -1,7 +1,7 @@
 diff --git a/components/rtl_sdr_v4_esp/src/rtl_sdr_v4_esp.cpp b/components/rtl_sdr_v4_esp/src/rtl_sdr_v4_esp.cpp
 --- a/components/rtl_sdr_v4_esp/src/rtl_sdr_v4_esp.cpp
 +++ b/components/rtl_sdr_v4_esp/src/rtl_sdr_v4_esp.cpp
-@@ -2037,20 +2037,67 @@ static void v3_probe_task_fn(void *arg)
+@@ -2037,24 +2037,68 @@ static void v3_probe_task_fn(void *arg)
                  ESP_LOGW(TAG, "retune worker failed: %s",
                           rtl_sdr_v4_esp_err_to_name(retune_err));
              }
@@ -29,7 +29,7 @@ diff --git a/components/rtl_sdr_v4_esp/src/rtl_sdr_v4_esp.cpp b/components/rtl_s
 +            h->pending_gain_db10 = -1;
 +
 +            /*
-+             * Tuner-gain writes use EP0 just like a hot retune.  Never issue
++             * Tuner-gain writes use EP0 just like a hot retune. Never issue
 +             * them while bulk URBs are live: stop resubmission, drain the
 +             * endpoint, perform the R820T2 register writes, then restore the
 +             * multi-URB stream.
@@ -63,7 +63,9 @@ diff --git a/components/rtl_sdr_v4_esp/src/rtl_sdr_v4_esp.cpp b/components/rtl_s
 +            if (h->streaming && h->bulk != nullptr) {
 +                h->live_urbs = 0;
 +                for (uint32_t i = 0; i < h->bulk_num; ++i) {
-+                    if (h->bulk[i] == nullptr) continue;
++                    if (h->bulk[i] == nullptr) {
++                        continue;
++                    }
 +                    h->bulk[i]->device_handle = h->dev;
 +                    h->bulk[i]->bEndpointAddress = RTL_SDR_V4_ESP_BULK_EP_IN;
 +                    h->bulk[i]->num_bytes = h->bulk_len;
@@ -83,3 +85,5 @@ diff --git a/components/rtl_sdr_v4_esp/src/rtl_sdr_v4_esp.cpp b/components/rtl_s
          if (!h->v3_probe_pending) {
              continue;
          }
+
+         const uint8_t addr = h->v3_probe_addr;
