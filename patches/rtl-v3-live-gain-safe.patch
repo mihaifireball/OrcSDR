@@ -1,0 +1,85 @@
+diff --git a/components/rtl_sdr_v4_esp/src/rtl_sdr_v4_esp.cpp b/components/rtl_sdr_v4_esp/src/rtl_sdr_v4_esp.cpp
+--- a/components/rtl_sdr_v4_esp/src/rtl_sdr_v4_esp.cpp
++++ b/components/rtl_sdr_v4_esp/src/rtl_sdr_v4_esp.cpp
+@@ -2037,20 +2037,67 @@ static void v3_probe_task_fn(void *arg)
+                 ESP_LOGW(TAG, "retune worker failed: %s",
+                          rtl_sdr_v4_esp_err_to_name(retune_err));
+             }
+         }
+-		if (h->pending_gain_db10 >= 0 &&
+-			h->streaming &&
+-			!h->v3_probe_pending) {
+-
+-			const int requested_gain = h->pending_gain_db10;
+-			h->pending_gain_db10 = -1;
+-
+-			const esp_err_t gain_err =
+-				v3_apply_gain_db10(h, requested_gain);
+-
+-			if (gain_err != ESP_OK) {
+-				ESP_LOGW(TAG,
+-						 "gain worker failed: %s",
+-						 rtl_sdr_v4_esp_err_to_name(gain_err));
+-			}
+-		}
++        if (h->pending_gain_db10 >= 0 &&
++            h->streaming &&
++            !h->v3_probe_pending) {
++            const int requested_gain = h->pending_gain_db10;
++            h->pending_gain_db10 = -1;
++
++            /*
++             * Tuner-gain writes use EP0 just like a hot retune.  Never issue
++             * them while bulk URBs are live: stop resubmission, drain the
++             * endpoint, perform the R820T2 register writes, then restore the
++             * multi-URB stream.
++             */
++            h->pause_resubmit = true;
++
++            const TickType_t deadline =
++                xTaskGetTickCount() + pdMS_TO_TICKS(800);
++            while (h->live_urbs > 0 && xTaskGetTickCount() < deadline) {
++                vTaskDelay(pdMS_TO_TICKS(2));
++            }
++            if (h->live_urbs > 0 && h->dev != nullptr) {
++                usb_host_endpoint_halt(h->dev, RTL_SDR_V4_ESP_BULK_EP_IN);
++                usb_host_endpoint_flush(h->dev, RTL_SDR_V4_ESP_BULK_EP_IN);
++                usb_host_endpoint_clear(h->dev, RTL_SDR_V4_ESP_BULK_EP_IN);
++                const TickType_t drain_deadline =
++                    xTaskGetTickCount() + pdMS_TO_TICKS(300);
++                while (h->live_urbs > 0 &&
++                       xTaskGetTickCount() < drain_deadline) {
++                    vTaskDelay(pdMS_TO_TICKS(2));
++                }
++                h->live_urbs = 0;
++            }
++
++            esp_err_t gain_err = RTL_SDR_V4_ESP_ERR_NOT_STREAMING;
++            if (h->streaming) {
++                gain_err = v3_apply_gain_db10(h, requested_gain);
++            }
++
++            h->pause_resubmit = false;
++            if (h->streaming && h->bulk != nullptr) {
++                h->live_urbs = 0;
++                for (uint32_t i = 0; i < h->bulk_num; ++i) {
++                    if (h->bulk[i] == nullptr) continue;
++                    h->bulk[i]->device_handle = h->dev;
++                    h->bulk[i]->bEndpointAddress = RTL_SDR_V4_ESP_BULK_EP_IN;
++                    h->bulk[i]->num_bytes = h->bulk_len;
++                    h->bulk[i]->callback = bulk_cb;
++                    h->bulk[i]->context = h;
++                    if (usb_host_transfer_submit(h->bulk[i]) == ESP_OK) {
++                        h->live_urbs = h->live_urbs + 1;
++                    }
++                }
++            }
++
++            if (gain_err != ESP_OK) {
++                ESP_LOGW(TAG, "gain worker failed: %s",
++                         rtl_sdr_v4_esp_err_to_name(gain_err));
++            }
++        }
+         if (!h->v3_probe_pending) {
+             continue;
+         }
