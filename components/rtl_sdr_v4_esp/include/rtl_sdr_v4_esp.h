@@ -441,6 +441,35 @@ esp_err_t rtl_sdr_v4_esp_get_metrics(rtl_sdr_v4_esp_handle_t handle,
                                      rtl_sdr_v4_esp_metrics_t *out_metrics);
 
 /* -------------------------------------------------------------------------- */
+/* Blog V3 tuner gain                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Copy supported Blog V3 tuner gains, in tenths of dB.
+ *
+ * Example: 197 means 19.7 dB.
+ */
+esp_err_t rtl_sdr_v4_esp_get_supported_gains(
+    rtl_sdr_v4_esp_handle_t handle,
+    int *out_gains,
+    size_t max_count,
+    size_t *out_count);
+
+/**
+ * Set manual Blog V3 tuner gain, in tenths of dB.
+ */
+esp_err_t rtl_sdr_v4_esp_set_gain_db10(
+    rtl_sdr_v4_esp_handle_t handle,
+    int gain_db10);
+
+/**
+ * Get currently selected Blog V3 tuner gain, in tenths of dB.
+ */
+esp_err_t rtl_sdr_v4_esp_get_gain_db10(
+    rtl_sdr_v4_esp_handle_t handle,
+    int *out_gain_db10);
+	
+/* -------------------------------------------------------------------------- */
 /* Streaming                                                                  */
 /* -------------------------------------------------------------------------- */
 

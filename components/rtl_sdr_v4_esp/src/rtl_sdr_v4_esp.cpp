@@ -105,6 +105,7 @@ struct rtl_sdr_v4_esp_handle {
     /* Blog V3 / R820T2 software shadow, registers 0x05..0x1f. */
     uint8_t v3_r820_regs[0x20 - 0x05]{};
     bool v3_r820_shadow_valid = false;
+	int v3_gain_db10 = 0;
 
     TaskHandle_t host_task = nullptr;
     TaskHandle_t client_task = nullptr;
@@ -2887,6 +2888,201 @@ esp_err_t rtl_sdr_v4_esp_start(rtl_sdr_v4_esp_handle_t handle,
         }
     }
     return ret;
+}
+
+static constexpr int kV3SupportedGainsDb10[] = {
+    0, 9, 14, 27, 37, 77, 87, 125, 144, 157,
+    166, 197, 207, 229, 254, 280, 297, 328,
+    338, 364, 372, 386, 402, 421, 434, 439,
+    445, 480, 496
+};
+
+static constexpr int kV3LnaGainStepsDb10[] = {
+    0, 9, 13, 40, 38, 13, 31, 22,
+    26, 31, 26, 14, 19, 5, 35, 13
+};
+
+static constexpr int kV3MixerGainStepsDb10[] = {
+    0, 5, 10, 10, 19, 9, 10, 25,
+    17, 10, 8, 16, 13, 6, 3, -8
+};
+
+static void v3_gain_indices_for_db10(
+    int gain_db10,
+    uint8_t *out_lna,
+    uint8_t *out_mixer)
+{
+    int total_gain = 0;
+    uint8_t lna_index = 0;
+    uint8_t mixer_index = 0;
+
+    for (int i = 0; i < 15; ++i) {
+        if (total_gain >= gain_db10) {
+            break;
+        }
+
+        ++lna_index;
+        total_gain += kV3LnaGainStepsDb10[lna_index];
+
+        if (total_gain >= gain_db10) {
+            break;
+        }
+
+        ++mixer_index;
+        total_gain += kV3MixerGainStepsDb10[mixer_index];
+    }
+
+    *out_lna = lna_index;
+    *out_mixer = mixer_index;
+}
+
+esp_err_t rtl_sdr_v4_esp_get_supported_gains(
+    rtl_sdr_v4_esp_handle_t handle,
+    int *out_gains,
+    size_t max_count,
+    size_t *out_count)
+{
+    if (!handle_ok(handle)) {
+        return RTL_SDR_V4_ESP_ERR_STALE_HANDLE;
+    }
+
+    if (out_count == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (std::strcmp(handle->info.product, kProductV3) != 0) {
+        return RTL_SDR_V4_ESP_ERR_UNSUPPORTED;
+    }
+
+    const size_t count = std::size(kV3SupportedGainsDb10);
+    *out_count = count;
+
+    if (out_gains == nullptr || max_count == 0) {
+        return ESP_OK;
+    }
+
+    const size_t copy_count = std::min(max_count, count);
+
+    for (size_t i = 0; i < copy_count; ++i) {
+        out_gains[i] = kV3SupportedGainsDb10[i];
+    }
+
+    if (max_count < count) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t rtl_sdr_v4_esp_set_gain_db10(
+    rtl_sdr_v4_esp_handle_t handle,
+    int gain_db10)
+{
+    if (!handle_ok(handle)) {
+        return RTL_SDR_V4_ESP_ERR_STALE_HANDLE;
+    }
+
+    if (std::strcmp(handle->info.product, kProductV3) != 0) {
+        return RTL_SDR_V4_ESP_ERR_UNSUPPORTED;
+    }
+
+    if (!handle->v3_r820_shadow_valid) {
+        return RTL_SDR_V4_ESP_ERR_NOT_READY;
+    }
+
+    size_t best = 0;
+    int best_delta = std::abs(gain_db10 - kV3SupportedGainsDb10[0]);
+
+    for (size_t i = 1; i < std::size(kV3SupportedGainsDb10); ++i) {
+        const int delta = std::abs(gain_db10 - kV3SupportedGainsDb10[i]);
+
+        if (delta < best_delta) {
+            best_delta = delta;
+            best = i;
+        }
+    }
+
+    /*
+     * Temporary first implementation:
+     * map the requested discrete gain to an LNA index while
+     * preserving the current mixer/VGA profile.
+     */
+
+    const int selected = kV3SupportedGainsDb10[best];
+
+	uint8_t lna_index = 0;
+	uint8_t mixer_index = 0;
+
+	v3_gain_indices_for_db10(
+		selected,
+		&lna_index,
+		&mixer_index);
+
+	/* LNA manual mode + gain index. */
+	esp_err_t err =
+		v3_r820_write_reg_mask(handle, 0x05, 0x10, 0x10);
+
+	if (err != ESP_OK) {
+		return err;
+	}
+
+	err = v3_r820_write_reg_mask(handle, 0x05, lna_index, 0x0f);
+
+	if (err != ESP_OK) {
+		return err;
+	}
+
+	/* Mixer manual mode + gain index. */
+	err = v3_r820_write_reg_mask(handle, 0x07, 0x00, 0x10);
+
+	if (err != ESP_OK) {
+		return err;
+	}
+
+	err = v3_r820_write_reg_mask(handle, 0x07, mixer_index, 0x0f);
+
+	if (err != ESP_OK) {
+		return err;
+	}
+
+	/* Standard manual R82xx VGA setting. */
+	err = v3_r820_write_reg_mask(handle, 0x0c, 0x08, 0x9f);
+
+	if (err != ESP_OK) {
+		return err;
+	}
+
+	handle->v3_gain_db10 = selected;
+
+    ESP_LOGI(
+		TAG,
+		"Blog V3 gain requested=%d applied=%d lna=%u mixer=%u vga=8",
+		gain_db10,
+		handle->v3_gain_db10,
+		static_cast<unsigned>(lna_index),
+		static_cast<unsigned>(mixer_index));
+
+    return ESP_OK;
+}
+
+esp_err_t rtl_sdr_v4_esp_get_gain_db10(
+    rtl_sdr_v4_esp_handle_t handle,
+    int *out_gain_db10)
+{
+    if (!handle_ok(handle)) {
+        return RTL_SDR_V4_ESP_ERR_STALE_HANDLE;
+    }
+
+    if (out_gain_db10 == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (std::strcmp(handle->info.product, kProductV3) != 0) {
+        return RTL_SDR_V4_ESP_ERR_UNSUPPORTED;
+    }
+
+    *out_gain_db10 = handle->v3_gain_db10;
+    return ESP_OK;
 }
 
 esp_err_t rtl_sdr_v4_esp_retune_hz(rtl_sdr_v4_esp_handle_t handle, uint32_t frequency_hz)
